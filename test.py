@@ -1,4 +1,3 @@
-
 import json
 import sys
 import logging
@@ -103,6 +102,32 @@ class OpponentAnalyzer:
                     danger_score += 0.4
 
         return min(1.0, danger_score)
+#相对上个版本增加
+class HandInfo:
+
+    def __init__(self):
+        self.shunzi=0#顺子数量
+        self.kezi=0#刻子数量
+        self.jiangpai=0#将牌
+        self.danpai=0#单牌
+        self.find_hu=False#是否胡牌
+        self.middle_pai_of_shunzi=[]#顺子牌的中间牌
+
+    def evaluate_score(self):
+#            计算评分
+        return(12 * self.shunzi +  10 * self.kezi +   (-100) * self.danpai +  6 * self.jiangpai)
+
+    def copy(self):
+        """深拷贝"""
+        newinfo = HandInfo()
+        newinfo.shunzi = self.shunzi
+        newinfo.kezi = self.kezi
+        newinfo.jiangpai = self.jiangpai
+        newinfo.danpai = self.danpai
+        newinfo.find_hu = self.find_hu
+        newinfo.middle_pai_of_shunzi = self.middle_pai_of_shunzi
+        return newinfo
+
 
 
 class EnhancedMahjongAI:
@@ -118,11 +143,16 @@ class EnhancedMahjongAI:
         self.pai_wall = [21, 21, 21, 21]
         self.gang_count = 0
         self.turn_count = 0
-        #添加一套新的手牌管理
-        self.shoupai=[0]*77
+        # 添加一套新的手牌管理
+        self.shoupai = [0] * 77
 
         self.efficiency_calculator = HandEfficiencyCalculator()
         self.opponent_analyzer = OpponentAnalyzer()
+        #相对上个版本增加
+        self.best_info = HandInfo()
+        self.not_sk_pai = [{"val": 0, "wei": 0} for _ in range(77)]
+        self.memo_cache = {}  # 记忆化缓存
+        self.max_depth = 20  # 限制递归深度
 
         # 策略权重（可动态调整）
         self.strategy_weights = {
@@ -166,6 +196,28 @@ class EnhancedMahjongAI:
             return 69 + 2 * num
         else:
             return -1
+
+#相对于上版本添加
+    def num2str(self, card_id: int) -> str:
+         if card_id<0:
+             return "??"
+         type_code=card_id//10
+
+         if type_code==0:
+             return f"B{card_id}"
+         elif type_code==2:
+             return f"T{card_id%10}"
+         elif type_code==4:
+             return f"W{card_id%10}"
+         elif type_code==6:
+             return f"F{(card_id-59)//2}"
+         elif type_code==7:
+             return f"J{(card_id-69)//2}"
+         else:
+             return "??"
+
+
+
 
     def is_my_shangjia(self, player_id: int) -> bool:
         """判断是否为上家"""
@@ -259,21 +311,131 @@ class EnhancedMahjongAI:
             'turn_count': self.turn_count
         }
 
+    def get_hand_key(self):
+        """生成手牌状态的缓存键，辅助记忆化存储"""
+        return tuple(self.shoupai[i] for i in range(1, 76) if self.shoupai[i] > 0)
+#新添加基于dfs实现的手牌分析
+    def dfs(self, shun_s, ke_s, temp_info, depth=0):
+        """优化版手牌分析 - 添加记忆化和剪枝"""
+
+        # 1. 深度限制
+        if depth > self.max_depth:
+            return
+
+        # 2. 记忆化检查
+        hand_key = self.get_hand_key()
+        if hand_key in self.memo_cache:
+            cached_result = self.memo_cache[hand_key]
+            if cached_result.evaluate_score() > self.best_info.evaluate_score():
+                self.best_info = cached_result.copy()
+            return
+
+        # 3. 剪枝：如果当前理论最大分数都不如已有最优解，直接返回
+        current_cards = sum(self.shoupai[i] for i in range(1, 76))
+        theoretical_max = current_cards * 12  # 假设全部组成顺子
+        if theoretical_max + self.best_info.evaluate_score() < self.best_info.evaluate_score():
+            return
+
+        # 4. 递归尝试顺子（限制范围）
+        for i in range(shun_s, min(50, shun_s + 20)):  # 限制搜索范围
+            if i % 10 == 0 or i % 10 > 9:
+                continue
+
+            if (i + 2 < 77 and self.shoupai[i] > 0 and
+                    self.shoupai[i + 1] > 0 and self.shoupai[i + 2] > 0):
+                # 组成顺子
+                temp_info.shunzi += 1
+                self.shoupai[i] -= 1
+                self.shoupai[i + 1] -= 1
+                self.shoupai[i + 2] -= 1
+                temp_info.middle_pai_of_shunzi.append(i + 1)
+
+                # 递归
+                self.dfs(i, 1, temp_info, depth + 1)
+
+                # 回溯
+                temp_info.middle_pai_of_shunzi.pop()
+                temp_info.shunzi -= 1
+                self.shoupai[i] += 1
+                self.shoupai[i + 1] += 1
+                self.shoupai[i + 2] += 1
+
+        # 5. 递归尝试刻子（限制范围）
+        for i in range(ke_s, min(76, ke_s + 15)):  # 限制搜索范围
+            if self.shoupai[i] >= 3:
+                temp_info.kezi += 1
+                self.shoupai[i] -= 3
+
+                # 递归
+                self.dfs(1, i + 1, temp_info, depth + 1)
+
+                # 回溯
+                temp_info.kezi -= 1
+                self.shoupai[i] += 3
+
+        # 6. 计算当前状态得分
+        self._calculate_final_score(temp_info)
+
+        # 7. 缓存结果
+        self.memo_cache[hand_key] = temp_info.copy()
+
+    def _calculate_final_score(self, temp_info):
+        """计算最终得分时正确更新not_sk_pai"""
+        # 已做修改
+        temp_info.danpai = 0
+        temp_info.jiangpai = 0
+
+        for i in range(1, 76):
+            if self.shoupai[i] == 1:
+                temp_info.danpai += 1
+            elif self.shoupai[i] == 2:
+                temp_info.jiangpai += 1
+
+        # 更新最优解
+        if temp_info.evaluate_score() > self.best_info.evaluate_score():
+            self.best_info = temp_info.copy()
+            # 关键：正确更新not_sk_pai，记录当前shoupai状态
+            for i in range(77):
+                self.not_sk_pai[i]["val"] = self.shoupai[i]
+                self.not_sk_pai[i]["wei"] = 0
+
+        # 检查胡牌
+        if temp_info.danpai == 0 and temp_info.jiangpai == 1:
+            temp_info.find_hu = True
+            if temp_info.evaluate_score() > self.best_info.evaluate_score():
+                self.best_info.find_hu = True
+
+        # 重置临时计数
+        temp_info.danpai = 0
+        temp_info.jiangpai = 0
+
+
+
     def check_hu(self, win_tile: str, is_self_drawn: bool) -> Tuple[bool, int]:
-        """修复后的胡牌检查函数"""
+        """胡牌检查函数"""
         try:
-            # 根据是否自摸来决定手牌状态
+            # 处理自摸和荣和的手牌状态
             if is_self_drawn:
-                # 自摸：使用除去摸到牌外的13张手牌
+                # 自摸：从当前14张手牌中移除一张win_tile，剩下13张用于算番
                 if len(self.hand) < 14:
+                    logging.debug(f"自摸手牌数量不足: {len(self.hand)}")
                     return False, 0
-                test_hand = [card for card in self.hand if card != win_tile]
-                if len(test_hand) < 13:
+                if win_tile not in self.hand:
+                    logging.debug(f"自摸牌不在手牌中: {win_tile}")
                     return False, 0
-                test_hand = test_hand[:13]  # 确保是13张
+
+                # 从手牌中移除一张win_tile
+                test_hand = self.hand.copy()
+                test_hand.remove(win_tile)
+
+                if len(test_hand) != 13:
+                    logging.debug(f"自摸后手牌数量错误: {len(test_hand)}")
+                    return False, 0
+
             else:
                 # 荣和：使用当前13张手牌
                 if len(self.hand) != 13:
+                    logging.debug(f"荣和手牌数量错误: {len(self.hand)}")
                     return False, 0
                 test_hand = self.hand.copy()
 
@@ -305,84 +467,167 @@ class EnhancedMahjongAI:
         except Exception as e:
             logging.error(f"胡牌检查失败: {str(e)}")
             return False, 0
-
+#修改
     def enhanced_decide_abandon_card(self) -> str:
-        """增强版弃牌决策"""
+        """重写的弃牌决策函数"""
         if not self.hand:
             return "B1"
 
         self.turn_count += 1
 
-        # 获取当前游戏状态
-        game_state = self.get_game_state()
+        # 1.重新同步手牌状态
+        logging.debug(f"=== 开始弃牌决策 ===")
+        logging.debug(f"当前手牌: {self.hand}")
 
-        # 1. 基础候选牌筛选
-        hand_counter = Counter(self.hand)
-        candidates = []
+        # 清空shoupai数组
+        for i in range(77):
+            self.shoupai[i] = 0
 
-        # 优先考虑单张牌
-        for card, count in hand_counter.items():
-            if count == 1:
-                candidates.append(card)
+        # 从hand重新构建shoupai
+        for card in self.hand:
+            card_num = self.strTonum(card)
+            if card_num > 0:
+                self.shoupai[card_num] += 1
 
-        # 如果没有单张，考虑多余的牌
-        if not candidates:
-            for card, count in hand_counter.items():
-                if count > 1:
-                    candidates.append(card)
+        # 清除旧缓存
+        self.memo_cache.clear()
 
-        if not candidates:
-            candidates = self.hand.copy()
+        # 2. 重新分析手牌
+        temp_info = HandInfo()
+        self.best_info = HandInfo()
+        self.best_info.danpai = 20  # 设置初始大值
 
-        # 2. 多维度评分
-        card_scores = {}
+        # 重置not_sk_pai
+        for i in range(77):
+            self.not_sk_pai[i] = {"val": 0, "wei": 0}
 
-        for card in set(candidates):  # 去重
-            if card not in self.hand:
+        self.dfs(1, 1, temp_info)
+
+        logging.debug(
+            f"分析结果: 顺子={self.best_info.shunzi}, 刻子={self.best_info.kezi}, 单牌={self.best_info.danpai}, 将牌={self.best_info.jiangpai}")
+
+        # 3. 候选牌分析
+        unique_cards = list(set(self.hand))
+        candidates = unique_cards
+
+        logging.debug(f"所有候选牌: {candidates}")
+
+        # 4. 重新实现权重计算
+        card_weights = {}
+
+        # 4.1 计算将牌对数（分别计算BTW和FJ）
+        jiang_pairs_btw = 0
+        jiang_pairs_fj = 0
+
+        # BTW范围：1-9(筒), 21-29(条), 41-49(万)
+        for i in list(range(1, 10)) + list(range(21, 30)) + list(range(41, 50)):
+            if self.not_sk_pai[i]["val"] == 2:
+                jiang_pairs_btw += 1
+
+        # FJ范围：61,63,65,67(风), 71,73,75(箭)
+        for i in range(61, 76, 2):
+            if self.not_sk_pai[i]["val"] == 2:
+                jiang_pairs_fj += 1
+
+        logging.debug(f"将牌对数 - BTW: {jiang_pairs_btw}, FJ: {jiang_pairs_fj}")
+
+        # 4.2 为每张候选牌计算权重
+        for card in candidates:
+            card_num = self.strTonum(card)
+            if card_num <= 0:
                 continue
 
-            score = 0
+            weight = 0
 
-            # 2.1 效率评分
-            temp_hand = self.hand.copy()
-            temp_hand.remove(card)
-            temp_counter = Counter(temp_hand)
-            shanten = self.efficiency_calculator.calculate_shanten(temp_counter)
-            score += (8 - shanten) * 10  # 向听数越小越好
+            # 规则1：BTW将牌权重 +250/将牌对数
+            if ((1 <= card_num <= 9) or (21 <= card_num <= 29) or (41 <= card_num <= 49)):
+                if self.not_sk_pai[card_num]["val"] == 2 and jiang_pairs_btw > 0:
+                    weight += 250 // jiang_pairs_btw
 
-            # 2.2 安全评分
-            danger = self.opponent_analyzer.assess_danger_level(card, self.turn_count)
-            score -= danger * 50  # 危险度越高扣分越多
+            # 规则1.1：FJ将牌权重 +350/将牌对数
+            elif (61 <= card_num <= 75) and card_num % 2 == 1:
+                if self.not_sk_pai[card_num]["val"] == 2 and jiang_pairs_fj > 0:
+                    weight += 350 // jiang_pairs_fj
 
-            # 2.3 牌池评分
-            card_num = self.strTonum(card)
-            if 0 < card_num < len(self.pai_chi):
-                if self.pai_chi[card_num] == 0:
-                    score -= 100  # 牌池中没有了，优先打出
-                else:
-                    score += self.pai_chi[card_num] * 5  # 剩余越多价值越高
+            # 规则2：BTW牌周围2格内牌的数量权重
+            if (1 <= card_num <= 9) or (21 <= card_num <= 29) or (41 <= card_num <= 49):
+                # 确保在同一花色内检查相邻牌
+                suit_start = card_num - (card_num % 10) if card_num % 10 != 0 else card_num - 10
+                suit_start = max(suit_start, 1)
 
-            # 2.4 特殊牌型评分
-            if card[0] in ['F', 'J']:  # 风牌箭牌
-                score -= 10  # 稍微降低价值
+                # 紧挨着的牌 +100
+                if card_num > suit_start and self.not_sk_pai[card_num - 1]["val"] > 0:
+                    weight += 100
+                if card_num < suit_start + 9 and self.not_sk_pai[card_num + 1]["val"] > 0:
+                    weight += 100
 
-            card_scores[card] = score
+                # 隔一个的牌 +50
+                if card_num > suit_start + 1 and self.not_sk_pai[card_num - 2]["val"] > 0:
+                    weight += 50
+                if card_num < suit_start + 8 and self.not_sk_pai[card_num + 2]["val"] > 0:
+                    weight += 50
 
-        # 4. 选择得分最低的牌（因为我们要丢弃）
-        if card_scores:
-            best_card = min(card_scores.keys(), key=lambda x: card_scores[x])
-            logging.debug(f"增强弃牌决策: {best_card}, 得分: {card_scores[best_card]}")
-            return best_card
+            # 规则3：BTW牌所在花色总张数权重 +50-k*10
+            if (1 <= card_num <= 9) or (21 <= card_num <= 29) or (41 <= card_num <= 49):
+                if 1 <= card_num <= 9:  # 筒子
+                    type_start, type_end = 1, 9
+                elif 21 <= card_num <= 29:  # 条子
+                    type_start, type_end = 21, 29
+                else:  # 万子
+                    type_start, type_end = 41, 49
 
+                k = sum(self.shoupai[j] for j in range(type_start, type_end + 1))
+                weight += max(0, 50 - 10 * k)
+
+            # 规则4：BTW牌在牌池剩余量 +5*剩余张数
+            if (1 <= card_num <= 9) or (21 <= card_num <= 29) or (41 <= card_num <= 49):
+                weight += 5 * self.pai_chi[card_num]
+
+            # 规则5：FJ牌在牌池剩余量 +10*剩余张数
+            elif (61 <= card_num <= 75) and card_num % 2 == 1:
+                weight += 10 * self.pai_chi[card_num]
+
+            # 规则6：绝张优先打出
+            if (self.best_info.danpai == 2 and self.best_info.jiangpai == 0 and
+                    self.not_sk_pai[card_num]["val"] > 0 and self.pai_chi[card_num] == 0):
+                weight = -9999  # 极低权重，优先打出
+
+            # 关键修复：如果是分析后的单牌，权重应该更低（更容易被打出）
+            if self.not_sk_pai[card_num]["val"] == 1:  # 单牌
+                weight -= 1000  # 大幅降低权重，优先打单牌
+
+            card_weights[card] = weight
+
+            logging.debug(
+                f"牌 {card}(#{card_num}): 权重={weight}, 分析剩余={self.not_sk_pai[card_num]['val']}, 牌池剩余={self.pai_chi[card_num]}")
+
+        # 5. 选择权重最低的牌（权重越低越优先打出）
+        if card_weights:
+            best_discard = min(card_weights.keys(), key=lambda x: card_weights[x])
+            min_weight = card_weights[best_discard]
+
+            logging.debug(f"=== 弃牌决策结果 ===")
+            logging.debug(f"选择打出: {best_discard}, 权重: {min_weight}")
+            logging.debug(f"所有牌权重排序: {sorted(card_weights.items(), key=lambda x: x[1])}")
+
+            return best_discard
+
+        # 6. 兜底
+        logging.warning("权重计算失败，返回第一张牌")
         return self.hand[0]
 
+    # 初始化not_sk_pai数组
+    def reset_not_sk_pai(self):
+        """重置not_sk_pai数组，确保状态正确"""
+        for i in range(77):
+            self.not_sk_pai[i] = {"val": 0, "wei": 0}
     def my_play(self, card: str):
         """打出牌时更新对手分析"""
         if card in self.hand:
             self.hand.remove(card)
             card_num = self.strTonum(card)
-            if card_num>0:
-                self.shoupai[card_num] += 1
+            if card_num > 0:
+                self.shoupai[card_num] -= 1
             self.opponent_analyzer.update_discard(self.my_id, card, self.turn_count)
             logging.debug(f"打出牌: {card}")
 
@@ -390,7 +635,7 @@ class EnhancedMahjongAI:
         """摸牌"""
         self.hand.append(card)
         card_num = self.strTonum(card)
-        if card_num>0:
+        if card_num > 0:
             self.pai_chi[card_num] -= 1
             self.shoupai[card_num] += 1
         # if self.strTonum(card) > 0:
@@ -407,7 +652,7 @@ class EnhancedMahjongAI:
         self.opponent_analyzer.update_action(player_id, action, {'details': details, 'turn': self.turn_count})
 
     def process_request(self, request: str) -> str:
-        """处理请求（修复胡牌逻辑）"""
+        """处理请求"""
         try:
             parts = request.split()
 
@@ -462,7 +707,7 @@ class EnhancedMahjongAI:
                     if player_id != self.my_id:
                         self.process_opponent_action(player_id, event, card)
 
-                        # 修复后的胡牌检查 - 荣和
+                        # 胡牌检查 - 荣和
                         can_hu, fan_count = self.check_hu(card, is_self_drawn=False)
                         if can_hu:
                             return json.dumps(
